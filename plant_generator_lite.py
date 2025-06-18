@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Plant Generator Lite",
     "author": "AI Assistant & Cogitoire",
-    "version": (0, 2, 0), # バージョンを少し上げました
+    "version": (0, 2, 1), # バージョンを少し上げました
     "blender": (3, 0, 0), # Blender 3.0以上を推奨
     "location": "View3D > Sidebar > Plant Gen Tab",
     "description": "Generates plant-like structures: Vogel patterns and L-Systems with presets.",
@@ -93,10 +93,25 @@ class VogelProperties(bpy.types.PropertyGroup):
         description="Scale of the instanced object",
         default=0.1, min=0.001, max=10.0
     )
-    align_to_normal: bpy.props.BoolProperty(
-        name="Align to Normal/Center",
-        description="Align instanced objects to face outwards from the center or along a calculated normal",
-        default=True
+    # align_to_normal は leaf_orientation_mode に置き換えられました
+    # align_to_normal: bpy.props.BoolProperty(
+    #     name="Align to Normal/Center",
+    #     description="Align instanced objects to face outwards from the center or along a calculated normal",
+    #     default=True
+    # )
+    leaf_orientation_mode: bpy.props.EnumProperty(
+        name="Leaf Orientation",
+        description="How to orient instanced leaves. Assumes leaf model's +Y is forward, +Z is up.",
+        items=[
+            ('NORMAL', "Align to Point Normal", "Align leaf's Y-axis outwards from the point, Z-axis towards World Up"),
+            ('UPWARD', "Upward (World Z)", "Align leaf's Y-axis to point upwards (World Z-axis)"),
+        ],
+        default='NORMAL',
+    )
+    leaf_upward_tilt_angle: bpy.props.FloatProperty(
+        name="Upward Tilt (Normal Mode)",
+        description="Angle to tilt leaves towards Z-up when 'Align to Point Normal' is active. 0°=Horizontal, 90°=Vertical.",
+        default=0.0, min=0.0, max=90.0, subtype='ANGLE', unit='ROTATION'
     )
 
 class LSystemProperties(bpy.types.PropertyGroup):
@@ -206,17 +221,46 @@ class VOGEL_OT_Generate(bpy.types.Operator):
                 new_obj.location = current_pos
                 new_obj.scale = (props.instance_scale, props.instance_scale, props.instance_scale)
 
-                if props.align_to_normal:
-                    if radius_xy > 0.0001:
-                        dir_to_point = Vector((x, y, 0)).normalized()
-                        quat_rotation = dir_to_point.to_track_quat('Y', 'Z')
-                        new_obj.rotation_mode = 'QUATERNION'
-                        new_obj.rotation_quaternion = quat_rotation
-                    else:
-                        new_obj.rotation_euler = (0,0,0)
-                else:
-                    new_obj.rotation_euler = source_obj.rotation_euler
+                # --- 葉の向きを制御 ---
+                new_obj.rotation_mode = 'QUATERNION'
 
+                # Assumes leaf instance model has its "forward" along its local Y-axis,
+                # and its "up" along its local Z-axis.
+
+                # Default rotation to make the leaf's local Y-axis point along World +Z (upwards).
+                # This is a 90-degree rotation around the World X-axis.
+                rot_y_to_world_z = Quaternion((1.0, 0.0, 0.0), math.radians(90.0))
+
+                if props.leaf_orientation_mode == 'UPWARD':
+                    new_obj.rotation_quaternion = rot_y_to_world_z
+                
+                elif props.leaf_orientation_mode == 'NORMAL':
+                    if radius_xy > 0.0001: # Not at the exact center
+                        # Direction from center in XY plane (horizontal component of normal)
+                        radial_dir_xy = Vector((x, y, 0.0)).normalized()
+                        world_z_axis = Vector((0.0, 0.0, 1.0))
+                        
+                        # tilt_factor: 0 means leaf Y-axis aligns with radial_dir_xy (horizontal)
+                        #              1 means leaf Y-axis aligns with world_z_axis (vertical)
+                        tilt_factor = props.leaf_upward_tilt_angle / 90.0
+                        
+                        # Calculate the target direction for the leaf's local Y-axis
+                        target_y_direction = radial_dir_xy.lerp(world_z_axis, tilt_factor).normalized()
+                        
+                        # Align leaf's local Y to target_y_direction, and local Z to World Z.
+                        # to_track_quat('Y', 'Z') does this:
+                        # - Rotates so local Y points along the vector it's called on (target_y_direction).
+                        # - Rotates so local Z points along World Z as much as possible.
+                        final_rotation = target_y_direction.to_track_quat('Y', 'Z')
+                        new_obj.rotation_quaternion = final_rotation
+                    else: # At the exact center
+                        # For the center point, make the leaf's Y-axis point upwards.
+                        new_obj.rotation_quaternion = rot_y_to_world_z
+                
+                # The original object's (instance_object) rotation is NOT applied here by default.
+                # The generated rotation is considered absolute for the instance.
+                # If you need to apply the source object's rotation as well, you could add:
+                # new_obj.rotation_quaternion @= props.instance_object.rotation_euler.to_quaternion()
                 generated_objects.append(new_obj)
 
             elif props.use_icospheres:
@@ -390,7 +434,7 @@ class LSYSTEM_OT_Generate(bpy.types.Operator):
                         try:
                             bm.faces.new(temp_leaf_verts)
                         except ValueError:
-                            pass
+                            pass # Avoids error with degenerate faces if any
                     leaf_bm.free()
 
         if len(bm.verts) > 0:
@@ -432,7 +476,9 @@ class PLANTGEN_PT_MainPanel(bpy.types.Panel):
         if v_props.use_custom_instance_object:
             box_vogel.prop(v_props, "instance_object")
             box_vogel.prop(v_props, "instance_scale")
-            box_vogel.prop(v_props, "align_to_normal")
+            box_vogel.prop(v_props, "leaf_orientation_mode")
+            if v_props.leaf_orientation_mode == 'NORMAL':
+                box_vogel.prop(v_props, "leaf_upward_tilt_angle")
         else:
             box_vogel.prop(v_props, "use_icospheres")
             if v_props.use_icospheres:
@@ -492,4 +538,16 @@ def unregister():
     del bpy.types.Scene.lsystem_props
 
 if __name__ == "__main__":
-    pass
+    # This part is for testing in Blender's text editor
+    # If you run this script directly, it will try to unregister first,
+    # then register, to allow for quick reloading.
+    try:
+        unregister()
+    except Exception as e:
+        print(f"Error during unregister (normal if first run): {e}")
+        pass
+    register()
+
+    # Example usage (optional, for testing)
+    # bpy.ops.plant_gen.vogel_generate()
+    # bpy.ops.plant_gen.lsystem_generate()
